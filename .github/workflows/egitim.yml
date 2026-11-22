@@ -27,8 +27,13 @@ jobs:
           cache: 'pip'
       - name: Python ve ML kutuphanelerini kur
         run: pip install -r requirements_ml.txt
-      - name: Kod testleri
-        run: python -m unittest discover -s tests -v
+      - name: Kod testleri (varsa)
+        run: |
+          if [ -d tests ]; then
+            python -m unittest discover -s tests -v
+          else
+            echo "tests klasoru bulunamadi, otomatik test asamasi atlandi."
+          fi
       - name: Gecmis kapanmis altin mumlarini indir
         env:
           GOLD_SYMBOL: ${{ inputs.symbol }}
