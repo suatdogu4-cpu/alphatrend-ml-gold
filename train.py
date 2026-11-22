@@ -1,4 +1,4 @@
-"""AlphaTrend ML GOLD v1.1 — research and backtesting ONLY; no live orders.
+"""AlphaTrend ML GOLD v1.2 — research and backtesting ONLY; no live orders.
 
 Original AlphaTrend algorithm © KivancOzbilgic, MPL-2.0:
 https://mozilla.org/MPL/2.0/
@@ -675,6 +675,46 @@ def make_report(args):
         "signal_ready_for_deployment": ready,
         "output": str(output.resolve()),
     }
+    # Small, phone-friendly flat comparison tables alongside the detailed JSON.
+    rows = []
+    for key, comparison in (
+        ('A AlphaTrend ML', audit_a), ('A Simple baseline', audit_a_ref),
+        ('B Squeeze ML', audit_b), ('B Simple baseline', audit_b_ref),
+        ('A on B same holdout', matched['A_alpha_on_squeeze_test']),
+        ('Fusion 50/50 on B same holdout', matched['fixed_50_50_blend_on_same_test']),
+    ):
+        rows.append({'model': key, 'samples': comparison['n'],
+                     'accuracy': comparison['accuracy'],
+                     'balanced_accuracy': comparison['balanced_accuracy'],
+                     'log_loss': comparison['log_loss']})
+    pd.DataFrame(rows).to_csv(output / 'model_comparison.csv', index=False)
+    ab_rows = []
+    for engine_name, group_info in [('A', ablate_a), ('B', ablate_b)]:
+        for group_name, stats in group_info.items():
+            if 'features' in stats:
+                ab_rows.append({'engine': engine_name, 'feature_set': group_name,
+                                'features': stats['features'],
+                                'validation_log_loss': stats['log_loss'],
+                                'validation_accuracy': stats['accuracy']})
+    pd.DataFrame(ab_rows).to_csv(output / 'feature_ablation.csv', index=False)
+    summary_text = (
+        'AlphaTrend ML GOLD v1.2 - EGITIM OZETI\n'
+        '------------------------------------\n'
+        f'Sembol: {args.symbol} / {args.tf}\n'
+        f'Kapanmis mum: {len(df)}\n'
+        f'AlphaTrend egitim olaylari: {len(engine_a)}\n'
+        f'Daralma egitim olaylari: {len(engine_b)}\n'
+        f'Test A (seyreltilmis): {len(a_test)} olay\n'
+        f'Test B: {len(b_test)} olay\n'
+        f'A modeli: {fit_a["selected"]} / dogruluk %{audit_a["accuracy"]*100:.2f}\n'
+        f'A referansi: %{audit_a_ref["accuracy"]*100:.2f}\n'
+        f'B modeli: {fit_b["selected"]} / dogruluk %{audit_b["accuracy"]*100:.2f}\n'
+        f'B referansi: %{audit_b_ref["accuracy"]*100:.2f}\n'
+        f'Ayni B olaylarinda sabit 50/50: %{matched["fixed_50_50_blend_on_same_test"]["accuracy"]*100:.2f}\n'
+        'CANLI ISLEM: HAYIR. GERCEK ALTIN ICIN AYRICA TEST GEREKLI.\n'
+        'Etiket dogrulugu kar-zarar veya islem isabeti demek degildir.\n'
+    )
+    (output / 'OZET_TR.txt').write_text(summary_text, encoding='utf-8')
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return report
 
@@ -701,5 +741,470 @@ def build_parser():
     return parser
 
 
-if __name__ == "__main__":
-    make_report(build_parser().parse_args())
+# =============================================================
+# v1.2 — DUAL ENGINE RESEARCH (preserves original AlphaTrend core)
+# A: Price / AlphaTrend / BUY-SELL behavior on every eligible closed bar
+# B: Squeeze beginnings only (legacy v1.1 task)
+# Predictions are compared on separate chronological holdouts.
+# =============================================================
+
+BASE_FEATURES = list(FEATURES[:18])
+AT_FEATURES = [f for f in FEATURES if f.startswith('at_')]
+MTF_FEATURES = [f for f in FEATURES if f.startswith('mtf')]
+SQUEEZE_FEATURES = [f for f in FEATURES if f not in BASE_FEATURES + AT_FEATURES + MTF_FEATURES]
+
+ALPHA_GROUPS = {
+    'teknik': BASE_FEATURES,
+    'teknik_alpha': BASE_FEATURES + AT_FEATURES,
+    'teknik_alpha_mtf': BASE_FEATURES + AT_FEATURES + MTF_FEATURES,
+}
+SQUEEZE_GROUPS = {
+    'daralma_teknik': BASE_FEATURES + SQUEEZE_FEATURES,
+    'daralma_alpha': BASE_FEATURES + SQUEEZE_FEATURES + AT_FEATURES,
+    'daralma_alpha_mtf': list(FEATURES),
+}
+
+
+def label_every_closed_bar(d: pd.DataFrame, horizon: int, barrier_atr: float, tf: str) -> pd.DataFrame:
+    """All eligible candle-close decisions; labels from *subsequent* candles.
+
+    A single future observation window is used for both engines. Events crossing
+    overnight / weekend gaps are excluded. The sample is densely overlapping,
+    so validation and test scores are measured on horizon-spaced observations.
+    """
+    unit = tf.lower().strip()
+    if not unit.endswith('m') or not unit[:-1].isdigit() or int(unit[:-1]) not in (1, 3, 5, 15):
+        raise ValueError('Girdi 1m, 3m, 5m veya 15m mum olmalı.')
+    if horizon < 1 or barrier_atr <= 0:
+        raise ValueError('horizon pozitif ve barrier_atr 0 uzeri olmalı.')
+    step = pd.Timedelta(minutes=int(unit[:-1]))
+    bad = d.time.diff().iloc[1:].ne(step).to_numpy(dtype=int)
+    gap_prefix = np.concatenate(([0], np.cumsum(bad)))
+    all_features = d[FEATURES].to_numpy(dtype=float)
+    good = np.isfinite(all_features).all(axis=1)
+    atr, close = d.atr.to_numpy(), d.close.to_numpy()
+    high, low = d.high.to_numpy(), d.low.to_numpy()
+    rows = []
+    for ix in range(len(d) - horizon):
+        if not good[ix] or not np.isfinite(atr[ix]) or atr[ix] <= 0:
+            continue
+        # Gap entries are transition indices from ix+1 through ix+horizon.
+        if gap_prefix[ix + horizon] != gap_prefix[ix]:
+            continue
+        upper, lower = close[ix] + atr[ix] * barrier_atr, close[ix] - atr[ix] * barrier_atr
+        result, bars, both_hit = 0, horizon, False
+        for j in range(ix + 1, ix + horizon + 1):
+            up, down = high[j] >= upper, low[j] <= lower
+            if up and down:
+                both_hit, bars = True, j - ix
+                break
+            if up or down:
+                result, bars = (1 if up else -1), j - ix
+                break
+        rows.append((ix, result, bars, both_hit))
+    if len(rows) < 300:
+        raise ValueError(f'AlphaTrend motoru icin yeterli uygun mum yok: {len(rows)}')
+    indices = [r[0] for r in rows]
+    cols = list(dict.fromkeys([
+        'time','close','alpha','atr','step_size','width_pct','squeeze','event',
+        'at_above','at_below','at_buy_raw','at_sell_raw','at_buy_valid',
+        'at_sell_valid','at_buy_confirmed','at_sell_confirmed',
+        'at_last_signal','at_signal_age'
+    ] + FEATURES))
+    out = d.loc[indices, cols].copy()
+    out['label'] = [r[1] for r in rows]
+    out['bars_to_outcome'] = [r[2] for r in rows]
+    out['ambiguous_bar'] = [r[3] for r in rows]
+    out['bar_index'] = indices
+    assert out.columns.is_unique
+    return out.reset_index(drop=True)
+
+
+def spaced_audit(frame: pd.DataFrame, horizon: int, start_index=None) -> pd.DataFrame:
+    """Evaluation subset with nonoverlapping future barrier horizons.
+
+    Sampling is precommitted by absolute source bar_index, independent of labels.
+    """
+    anchor = 0 if start_index is None else int(start_index)
+    return frame.loc[(frame.bar_index - anchor) % horizon == 0].copy()
+
+
+def align_alpha_folds(all_bars: pd.DataFrame, squeeze_folds, horizon: int):
+    folds = []
+    for _, squeeze_val in squeeze_folds:
+        first = int(squeeze_val.bar_index.min())
+        last = int(squeeze_val.bar_index.max())
+        # Purge training rows whose future labeling extends into validation.
+        alpha_fit = all_bars.loc[all_bars.bar_index + horizon < first].copy()
+        alpha_val = all_bars.loc[(all_bars.bar_index >= first) &
+                                 (all_bars.bar_index <= last)].copy()
+        alpha_val = spaced_audit(alpha_val, horizon, first)
+        if len(alpha_fit) < 100 or len(alpha_val) < 10 or alpha_fit.label.nunique() < 2:
+            raise ValueError('AlphaTrend walk-forward verisi yetersiz; daha uzun OHLCV gecmisi gerekli.')
+        folds.append((alpha_fit, alpha_val))
+    return folds
+
+
+def compare_ablation(groups: dict, folds, estimator_name='hist_gradient_boosting'):
+    """Fixed-family A/B feature ablation on the *same* chronology.
+
+    The feature group comparisons are diagnostics; no holdout data is used
+    to select input features.
+    """
+    constructors, _ = candidates()
+    results = {}
+    for feature_group, cols in groups.items():
+        y_parts, p_parts = [], []
+        try:
+            for fit, val in folds:
+                model, enc = fit_model(estimator_name, constructors[estimator_name],
+                                       fit[cols], fit.label)
+                y_parts.append(val.label.to_numpy(dtype=int))
+                p_parts.append(aligned_proba(model, enc, val[cols]))
+            result = metrics(np.concatenate(y_parts), np.concatenate(p_parts))
+            results[feature_group] = {'features': len(cols), 'log_loss': result['log_loss'],
+                                      'balanced_accuracy': result['balanced_accuracy'],
+                                      'accuracy': result['accuracy'], 'n': result['n']}
+        except Exception as exc:
+            results[feature_group] = {'error': f'{type(exc).__name__}: {exc}'}
+    keys = list(groups)
+    for name, before, after in (('alpha_features_effect', keys[0], keys[1]),
+                                ('mtf_features_effect', keys[1], keys[2])):
+        if 'log_loss' in results[before] and 'log_loss' in results[after]:
+            diff = round(results[after]['log_loss'] - results[before]['log_loss'], 5)
+            results[name] = {
+                'before': before, 'after': after,
+                'delta_log_loss': diff, 'helped_on_validation': diff < 0,
+                'note': 'Negative delta improves log loss for the fixed reference ML family; not proof of profit.'
+            }
+    return results
+
+
+def cross_validate_engine(folds, cols, engine_name: str, min_gain: float):
+    """Select a model family using validation only; the test remains untouched."""
+    constructors, missing = candidates()
+    comparison, failed = {}, {}
+    successful = {}
+    oof = {}
+    for name, factory in constructors.items():
+        y_chunks, p_chunks, fold_scores = [], [], []
+        try:
+            for fit, val in folds:
+                estimator, enc = fit_model(name, factory, fit[cols], fit.label)
+                prediction = aligned_proba(estimator, enc, val[cols])
+                y_chunks.append(val.label.to_numpy(dtype=int))
+                p_chunks.append(prediction)
+                fold_scores.append(metrics(val.label, prediction))
+            yy, pp = np.concatenate(y_chunks), np.vstack(p_chunks)
+            comparison[name] = {
+                'pooled': metrics(yy, pp),
+                'folds': fold_scores,
+                'fold_count': len(fold_scores),
+            }
+            successful[name] = factory
+            oof[name] = (yy, pp)
+        except Exception as exc:
+            failed[name] = f'{type(exc).__name__}: {exc}'
+    if 'reference_prior' not in successful:
+        raise ValueError(f'{engine_name}: referans modeli egitilemedi: {failed}')
+    contenders = [name for name in successful if name != 'reference_prior']
+    if not contenders:
+        raise ValueError(f'{engine_name}: hicbir ML algoritmasi egitilemedi: {failed}')
+    selected = min(contenders, key=lambda name: comparison[name]['pooled']['log_loss'])
+    baseline_loss = comparison['reference_prior']['pooled']['log_loss']
+    ml_loss = comparison[selected]['pooled']['log_loss']
+    validation_gain = round(baseline_loss - ml_loss, 5)
+    yy, pp = oof[selected]
+    temperature = 1.0
+    # Temperature calibration on *only* the chronological out-of-fold scores.
+    if len(yy) >= 60:
+        def loss(temp):
+            return log_loss(yy, temperature_scale(pp, temp), labels=CLASS_VALUES)
+        optimized = minimize_scalar(loss, bounds=(0.7, 3.0), method='bounded')
+        if optimized.success and loss(float(optimized.x)) + 1e-5 < loss(1.0):
+            temperature = float(optimized.x)
+    return {
+        'name': engine_name,
+        'selected': selected,
+        'constructors': successful,
+        'features': cols,
+        'temperature': temperature,
+        'comparison': comparison,
+        'missing_libraries': missing,
+        'errors': failed,
+        'validation_baseline_log_loss': baseline_loss,
+        'validation_selected_log_loss': ml_loss,
+        'validation_gain': validation_gain,
+        'validated_better_than_baseline': validation_gain >= min_gain,
+        'selected_calibrated_oof': metrics(yy, temperature_scale(pp, temperature)),
+    }
+
+
+def train_final_engine(result: dict, fit: pd.DataFrame, test: pd.DataFrame):
+    cols = result['features']
+    name = result['selected']
+    mdl, encoded = fit_model(name, result['constructors'][name], fit[cols], fit.label)
+    ref, ref_encoded = fit_model('reference_prior', result['constructors']['reference_prior'],
+                                 fit[cols], fit.label)
+    predictions = temperature_scale(aligned_proba(mdl, encoded, test[cols]), result['temperature'])
+    baselines = aligned_proba(ref, ref_encoded, test[cols])
+    return mdl, encoded, predictions, baselines
+
+
+def save_predictions(frame, probas: dict, path: Path, extra_cols=None):
+    cols = ['time', 'bar_index', 'close', 'alpha', 'at_above', 'at_below',
+            'at_buy_valid', 'at_sell_valid', 'at_last_signal', 'at_signal_age', 'label']
+    cols += [k for k in (extra_cols or []) if k in frame.columns and k not in cols]
+    out = frame[cols].copy()
+    for name, p in probas.items():
+        out[f'{name}_pred'] = CLASS_VALUES[np.argmax(p, axis=1)]
+        for i, klass in enumerate(CLASS_VALUES):
+            out[f'{name}_prob_{CLASS_NAMES[int(klass)].lower()}'] = p[:, i]
+    out.to_csv(path, index=False)
+
+
+def native_signal_outcome_audit(events):
+    """What happened AFTER original raw/filtered/confirmed BUY and SELL bars?
+
+    Event's own close is treated as a reference for a future-outcome label;
+    these are not executable fill-based return statistics.
+    """
+    result = {}
+    for column, target in (
+        ('at_buy_raw', 1), ('at_sell_raw', -1),
+        ('at_buy_valid', 1), ('at_sell_valid', -1),
+        ('at_buy_confirmed', 1), ('at_sell_confirmed', -1)
+    ):
+        mask = events[column].to_numpy(dtype=bool)
+        n = int(mask.sum())
+        correct = int((events.loc[mask, 'label'] == target).sum())
+        result[column] = {
+            'n': n, 'correct_direction': correct,
+            'direction_hit_rate': round(correct / n, 5) if n else None,
+            'ambiguous': int((events.loc[mask, 'label'] == 0).sum()),
+            'warning': 'Sample count may be too small; this is an event outcome, not trading P&L.'
+        }
+    return result
+
+
+def make_dual_report(args):
+    if args.min_events < 35:
+        raise ValueError('Araştırma icin en az 35 daralma olayi gerekir.')
+    df = load_csv(args.csv)
+    d = make_features(df, period=args.period, multiplier=args.multiplier,
+                      band_mult=args.band_mult, sqz_len=args.sqz_len, lookback=args.lookback,
+                      sqz_factor=args.sqz_factor, use_rsi=args.use_rsi)
+    d, mtf_targets = augment_mtf_features(d, tf=args.tf, period=args.period,
+                         multiplier=args.multiplier, band_mult=args.band_mult,
+                         sqz_len=args.sqz_len, lookback=args.lookback,
+                         sqz_factor=args.sqz_factor, use_rsi=args.use_rsi)
+    # The two tasks share future-outcome rules and a single test date boundary.
+    engine_b = label_events(d, horizon=args.horizon, barrier_atr=args.barrier_atr,
+                            min_events=args.min_events, tf=args.tf)
+    engine_a = label_every_closed_bar(d, horizon=args.horizon,
+                                      barrier_atr=args.barrier_atr, tf=args.tf)
+    b_folds, b_final, b_test = purged_splits(engine_b, args.horizon, args.min_events)
+    a_folds = align_alpha_folds(engine_a, b_folds, args.horizon)
+    test_start = int(b_test.bar_index.min())
+    a_final = engine_a.loc[engine_a.bar_index + args.horizon < test_start].copy()
+    a_test_window = engine_a.loc[(engine_a.bar_index >= test_start) &
+                                 (engine_a.bar_index <= int(b_test.bar_index.max()))].copy()
+    a_test = spaced_audit(a_test_window, args.horizon, test_start)
+    if len(a_test) < 20 or a_final.label.nunique() < 2:
+        raise ValueError('Motor A bagimsiz testi icin yeterli zaman verisi yok.')
+    # Same future labels for both engines at their shared squeeze indices.
+    pairs = engine_a.set_index('bar_index')['label'].reindex(engine_b.bar_index)
+    if pairs.isna().any() or not np.array_equal(pairs.to_numpy(dtype=int), engine_b.label.to_numpy(dtype=int)):
+        raise AssertionError('Motor A/B olay etiketleri ayni zaman damgasinda uyusmuyor.')
+
+    # Ablation explicitly checks whether AT core / BUY-SELL / MTF add value.
+    ablate_a = compare_ablation(ALPHA_GROUPS, a_folds)
+    ablate_b = compare_ablation(SQUEEZE_GROUPS, b_folds)
+
+    fit_a = cross_validate_engine(a_folds, ALPHA_GROUPS['teknik_alpha_mtf'],
+                                   'alpha_all_closed_bars', args.min_logloss_gain)
+    fit_b = cross_validate_engine(b_folds, SQUEEZE_GROUPS['daralma_alpha_mtf'],
+                                   'squeeze_start_events', args.min_logloss_gain)
+    model_a, encoded_a, probs_a, prior_a = train_final_engine(fit_a, a_final, a_test)
+    model_b, encoded_b, probs_b, prior_b = train_final_engine(fit_b, b_final, b_test)
+    # Evaluate A at the EXACT same B test events: fair matched comparison.
+    a_at_b = temperature_scale(aligned_proba(model_a, encoded_a,
+                        b_test[fit_a['features']]), fit_a['temperature'])
+    # Fixed weights declared before observing holdout; never grid-search weights on holdout.
+    blend = (a_at_b + probs_b) / 2.0
+    blend /= blend.sum(axis=1, keepdims=True)
+
+    audit_a = metrics(a_test.label, probs_a)
+    audit_a_ref = metrics(a_test.label, prior_a)
+    audit_b = metrics(b_test.label, probs_b)
+    audit_b_ref = metrics(b_test.label, prior_b)
+    matched = {
+        'A_alpha_on_squeeze_test': metrics(b_test.label, a_at_b),
+        'B_squeeze_on_same_test': audit_b,
+        'fixed_50_50_blend_on_same_test': metrics(b_test.label, blend),
+        'B_reference_same_test': audit_b_ref,
+    }
+    ready = False  # Never use retrospective classification alone as live approval.
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    # Keep the historical squeeze table and deliver compact all-bar labels.
+    engine_b.to_csv(output / 'events_squeeze.csv', index=False)
+    engine_a[['time','bar_index','close','alpha','at_above','at_below',
+              'at_buy_raw','at_sell_raw','at_buy_valid','at_sell_valid',
+              'at_buy_confirmed','at_sell_confirmed', 'at_last_signal','at_signal_age',
+              'squeeze','label','bars_to_outcome','ambiguous_bar']].to_csv(
+                  output / 'alpha_all_candles_labels.csv', index=False)
+    save_predictions(a_test, {'alpha_ml': probs_a, 'alpha_reference': prior_a},
+                     output / 'test_A_predictions.csv')
+    save_predictions(b_test, {'alpha_ml': a_at_b, 'squeeze_ml': probs_b,
+                              'fusion_50_50': blend, 'reference': prior_b},
+                     output / 'test_B_fusion_predictions.csv', extra_cols=['width_pct','at_buy_raw','at_sell_raw'])
+
+    last = d.iloc[-1]
+    last_a = None
+    if np.isfinite(last[fit_a['features']].to_numpy(dtype=float)).all():
+        last_a = temperature_scale(aligned_proba(model_a, encoded_a,
+                            d.iloc[[-1]][fit_a['features']]), fit_a['temperature'])[0]
+    last_b = None
+    if bool(last.event) and np.isfinite(last[fit_b['features']].to_numpy(dtype=float)).all():
+        last_b = temperature_scale(aligned_proba(model_b, encoded_b,
+                            d.iloc[[-1]][fit_b['features']]), fit_b['temperature'])[0]
+    latest = {
+        'data_time_utc': str(last.time), 'symbol': args.symbol, 'tf': args.tf,
+        'data_is_live': False, 'last_close': float(last.close),
+        'alpha': float(last.alpha), 'price_above_alpha': bool(last.at_above),
+        'price_below_alpha': bool(last.at_below),
+        'raw_buy': bool(last.at_buy_raw), 'raw_sell': bool(last.at_sell_raw),
+        'valid_buy': bool(last.at_buy_valid), 'valid_sell': bool(last.at_sell_valid),
+        'confirmed_buy': bool(last.at_buy_confirmed), 'confirmed_sell': bool(last.at_sell_confirmed),
+        'last_valid_signal': int(last.at_last_signal), 'bars_since_valid_signal': int(last.at_signal_age),
+        'squeeze_active': bool(last.squeeze), 'new_squeeze_event': bool(last.event),
+        'research_alpha_probabilities': {CLASS_NAMES[int(v)]: float(last_a[i]) for i,v in enumerate(CLASS_VALUES)} if last_a is not None else None,
+        'research_squeeze_event_probabilities': {CLASS_NAMES[int(v)]: float(last_b[i]) for i,v in enumerate(CLASS_VALUES)} if last_b is not None else None,
+        'decision': 'BEKLE — OOS AVANTAJ DOGRULANMADI',
+        'note': 'Historical dataset last candle, not a live signal. No real orders.'
+    }
+    (output / 'latest_analysis.json').write_text(json.dumps(latest, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    def display_engine(result):
+        return {
+            'feature_count': len(result['features']),
+            'feature_names': result['features'],
+            'selected_model': result['selected'],
+            'validation_models': {name: {'pooled': v['pooled'], 'fold_count': v['fold_count']}
+                                  for name, v in result['comparison'].items()},
+            'validation_baseline_log_loss': result['validation_baseline_log_loss'],
+            'validation_ml_log_loss': result['validation_selected_log_loss'],
+            'validation_gain': result['validation_gain'],
+            'beats_baseline_validation_guard': result['validated_better_than_baseline'],
+            'temperature_from_validation': round(result['temperature'], 4),
+            'calibrated_oof': result['selected_calibrated_oof'],
+            'optional_model_errors': result['errors'],
+            'missing_libraries': result['missing_libraries'],
+        }
+    report = {
+        'version': '1.2', 'dataset_symbol': args.symbol, 'data_source': str(args.csv),
+        'timeframe': args.tf, 'first_bar_utc': str(df.time.iloc[0]),
+        'last_bar_utc': str(df.time.iloc[-1]), 'candles': len(df),
+        'horizon_bars': args.horizon, 'barrier_atr': args.barrier_atr,
+        'mtf_minutes': list(mtf_targets), 'data_type': 'historical_closed_candles',
+        'alpha_all_bars_labeled': len(engine_a),
+        'alpha_train_rows': len(a_final), 'alpha_test_independent_horizon_spaced': len(a_test),
+        'alpha_buy_valid_count_all': int(engine_a.at_buy_valid.sum()),
+        'alpha_sell_valid_count_all': int(engine_a.at_sell_valid.sum()),
+        'alpha_buy_confirmed_count_all': int(engine_a.at_buy_confirmed.sum()),
+        'alpha_sell_confirmed_count_all': int(engine_a.at_sell_confirmed.sum()),
+        'squeeze_events': len(engine_b), 'squeeze_train_events': len(b_final),
+        'squeeze_test_events': len(b_test),
+        'squeeze_labels_all': {CLASS_NAMES[int(i)]: int((engine_b.label == i).sum()) for i in CLASS_VALUES},
+        'shared_test_start_utc': str(b_test.time.iloc[0]),
+        'feature_ablation_alpha_motor': ablate_a,
+        'feature_ablation_squeeze_motor': ablate_b,
+        'motor_A': display_engine(fit_a), 'motor_B': display_engine(fit_b),
+        'test_motor_A_nonoverlap': audit_a,
+        'test_motor_A_reference_nonoverlap': audit_a_ref,
+        'test_motor_B': audit_b,
+        'test_motor_B_reference': audit_b_ref,
+        'test_same_squeeze_events': matched,
+        'test_alpha_line_and_buy_sell_segments': alpha_segment_audit(a_test, probs_a),
+        'test_squeeze_line_and_buy_sell_segments': alpha_segment_audit(b_test, probs_b),
+        'native_buy_sell_outcomes_motor_A_test': native_signal_outcome_audit(a_test_window),
+        'native_buy_sell_outcomes_motor_B_test': native_signal_outcome_audit(b_test),
+        'test_alpha_signal_threshold': threshold_audit(a_test.label, probs_a, args.signal_threshold, args.signal_margin),
+        'test_squeeze_signal_threshold': threshold_audit(b_test.label, probs_b, args.signal_threshold, args.signal_margin),
+        'deployment_ready': ready,
+        'evidence_warning': 'Two research models and a fixed fusion are compared on historical outcomes; this is NOT a validated trading advantage.',
+        'limitations': [
+            'GC=F altin vadelidir; XAUUSD/XAUUSDT degildir.',
+            'Yalnizca kapanmis mumlar ve gecmiste bilinen indikatorler kullanilir.',
+            'A motoru tum uygun mumlarda egitilir; komsu hedefler ortusebilir. Bagimsiz test A icin horizon aralikli seyreltildi.',
+            'B motoru sadece daralma baslangiclarinda egitilir; veri sayisi daha az olabilir.',
+            'A/B modeli ayni daralma test olaylarinda ayrica karsilastirildi; 50/50 agirlik testte ayarlanmadi.',
+            'Etiketler gelecekteki mumlarda hedefe ilk ulasilmasina gore olusturulur; ayni mumda iki hedefe dokunulursa belirsiz.',
+            'Baska piyasa donemlerinde daha uzun, gercek XAUUSD/XAUUSDT OHLCV ve gercek fiyat yayilimi maliyetleri test edilmelidir.',
+            'Model secimi walk-forward validation ile yapilir; holdout yalnizca raporlanir.',
+            'Komisyon, spread, slippage, gecikme ve gercek emir yurutme getirisi hesaplanmaz.',
+            'Olasilik kalibrasyonu zaman disi farkli piyasalarda dogrulanmadi. Canli emirler kapali.',
+        ]
+    }
+    (output / 'report.json').write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
+    joblib.dump({'model': model_a, 'encoded': encoded_a, 'features': fit_a['features'],
+                 'temperature': fit_a['temperature'], 'tf': args.tf, 'name': fit_a['selected']}, output / 'engine_A.joblib')
+    joblib.dump({'model': model_b, 'encoded': encoded_b, 'features': fit_b['features'],
+                 'temperature': fit_b['temperature'], 'tf': args.tf, 'name': fit_b['selected']}, output / 'engine_B.joblib')
+    summary = {
+        'version': '1.2', 'candles': len(df), 'alpha_training_bars': len(engine_a),
+        'squeeze_events': len(engine_b), 'test_A_independent': len(a_test),
+        'test_B': len(b_test), 'model_A': fit_a['selected'], 'model_B': fit_b['selected'],
+        'A_accuracy': audit_a['accuracy'], 'A_reference_accuracy': audit_a_ref['accuracy'],
+        'B_accuracy': audit_b['accuracy'], 'B_reference_accuracy': audit_b_ref['accuracy'],
+        'fusion_accuracy_on_B': matched['fixed_50_50_blend_on_same_test']['accuracy'],
+        'deployment_ready': False,
+        'output_directory': str(output.resolve()),
+    }
+    # Small, phone-friendly flat comparison tables alongside the detailed JSON.
+    rows = []
+    for key, comparison in (
+        ('A AlphaTrend ML', audit_a), ('A Simple baseline', audit_a_ref),
+        ('B Squeeze ML', audit_b), ('B Simple baseline', audit_b_ref),
+        ('A on B same holdout', matched['A_alpha_on_squeeze_test']),
+        ('Fusion 50/50 on B same holdout', matched['fixed_50_50_blend_on_same_test']),
+    ):
+        rows.append({'model': key, 'samples': comparison['n'],
+                     'accuracy': comparison['accuracy'],
+                     'balanced_accuracy': comparison['balanced_accuracy'],
+                     'log_loss': comparison['log_loss']})
+    pd.DataFrame(rows).to_csv(output / 'model_comparison.csv', index=False)
+    ab_rows = []
+    for engine_name, group_info in [('A', ablate_a), ('B', ablate_b)]:
+        for group_name, stats in group_info.items():
+            if 'features' in stats:
+                ab_rows.append({'engine': engine_name, 'feature_set': group_name,
+                                'features': stats['features'],
+                                'validation_log_loss': stats['log_loss'],
+                                'validation_accuracy': stats['accuracy']})
+    pd.DataFrame(ab_rows).to_csv(output / 'feature_ablation.csv', index=False)
+    summary_text = (
+        'AlphaTrend ML GOLD v1.2 - EGITIM OZETI\n'
+        '------------------------------------\n'
+        f'Sembol: {args.symbol} / {args.tf}\n'
+        f'Kapanmis mum: {len(df)}\n'
+        f'AlphaTrend egitim olaylari: {len(engine_a)}\n'
+        f'Daralma egitim olaylari: {len(engine_b)}\n'
+        f'Test A (seyreltilmis): {len(a_test)} olay\n'
+        f'Test B: {len(b_test)} olay\n'
+        f'A modeli: {fit_a["selected"]} / dogruluk %{audit_a["accuracy"]*100:.2f}\n'
+        f'A referansi: %{audit_a_ref["accuracy"]*100:.2f}\n'
+        f'B modeli: {fit_b["selected"]} / dogruluk %{audit_b["accuracy"]*100:.2f}\n'
+        f'B referansi: %{audit_b_ref["accuracy"]*100:.2f}\n'
+        f'Ayni B olaylarinda sabit 50/50: %{matched["fixed_50_50_blend_on_same_test"]["accuracy"]*100:.2f}\n'
+        'CANLI ISLEM: HAYIR. GERCEK ALTIN ICIN AYRICA TEST GEREKLI.\n'
+        'Etiket dogrulugu kar-zarar veya islem isabeti demek degildir.\n'
+    )
+    (output / 'OZET_TR.txt').write_text(summary_text, encoding='utf-8')
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return report
+
+
+if __name__ == '__main__':
+    make_dual_report(build_parser().parse_args())
