@@ -9,14 +9,14 @@ on:
         options: ['5m', '15m', '1m']
         default: '5m'
       symbol:
-        description: 'Yahoo veri sembolu (GC=F: altin vadeli)'
+        description: 'Yahoo sembolu (GC=F: vadeli altin)'
         required: true
         default: 'GC=F'
         type: string
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
       contents: read
     steps:
@@ -25,17 +25,30 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-      - name: Kutuphaneleri kur
-        run: pip install -r requirements.txt
-      - name: Kapanmis mum verisi cek
-        run: python fetch_gold.py --symbol '${{ inputs.symbol }}' --tf '${{ inputs.tf }}' --output gold.csv
-      - name: Egit ve test et
-        run: python train.py --csv gold.csv --symbol '${{ inputs.symbol }}' --tf '${{ inputs.tf }}' --output result
-      - name: Raporlari indirilebilir yap
+      - name: Python ve ML kutuphanelerini kur
+        run: pip install -r requirements_ml.txt
+      - name: Kod testleri (dosya yuklendiyse)
+        run: |
+          if [ -f tests/test_ml.py ]; then
+            python -m unittest discover -s tests -v
+          else
+            echo "Opsiyonel test dosyasi bulunmadi; egitime devam."
+          fi
+      - name: Kapanmis altin mumlarini indir
+        env:
+          GOLD_SYMBOL: ${{ inputs.symbol }}
+          GOLD_TF: ${{ inputs.tf }}
+        run: python fetch_gold.py --symbol "$GOLD_SYMBOL" --tf "$GOLD_TF" --output gold.csv
+      - name: AlphaTrend ML v1.1 egitimi ve test
+        env:
+          GOLD_SYMBOL: ${{ inputs.symbol }}
+          GOLD_TF: ${{ inputs.tf }}
+        run: python train.py --csv gold.csv --symbol "$GOLD_SYMBOL" --tf "$GOLD_TF" --output result
+      - name: Raporlari yukle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: alphatrend-ml-egitim-sonucu
+          name: alphatrend-ml-egitim-sonucu-v1-1
           path: |
             result/*.json
             result/*.csv
