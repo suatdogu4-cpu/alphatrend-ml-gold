@@ -9,14 +9,14 @@ on:
         options: ['5m', '15m', '1m']
         default: '5m'
       symbol:
-        description: 'Yahoo sembolu (GC=F: vadeli altin)'
+        description: 'Yahoo veri sembolu (GC=F: altin vadeli)'
         required: true
         default: 'GC=F'
         type: string
 jobs:
   train:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -27,29 +27,26 @@ jobs:
           cache: 'pip'
       - name: Python ve ML kutuphanelerini kur
         run: pip install -r requirements_ml.txt
-      - name: Kod testleri (dosya yuklendiyse)
-        run: |
-          if [ -f tests/test_ml.py ]; then
-            python -m unittest discover -s tests -v
-          else
-            echo "Opsiyonel test dosyasi bulunmadi; egitime devam."
-          fi
-      - name: Kapanmis altin mumlarini indir
+      - name: Kod testleri
+        run: python -m unittest discover -s tests -v
+      - name: Gecmis kapanmis altin mumlarini indir
         env:
           GOLD_SYMBOL: ${{ inputs.symbol }}
           GOLD_TF: ${{ inputs.tf }}
         run: python fetch_gold.py --symbol "$GOLD_SYMBOL" --tf "$GOLD_TF" --output gold.csv
-      - name: AlphaTrend ML v1.1 egitimi ve test
+      - name: AlphaTrend ML v1.2 iki motorlu egitim
         env:
           GOLD_SYMBOL: ${{ inputs.symbol }}
           GOLD_TF: ${{ inputs.tf }}
         run: python train.py --csv gold.csv --symbol "$GOLD_SYMBOL" --tf "$GOLD_TF" --output result
-      - name: Raporlari yukle
+      - name: Iki motorlu rapor ve model dosyalarini yukle
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: alphatrend-ml-egitim-sonucu-v1-1
+          name: alphatrend-ml-egitim-sonucu-v1-2
           path: |
             result/*.json
             result/*.csv
+            result/*.joblib
+            result/*.txt
           if-no-files-found: warn
