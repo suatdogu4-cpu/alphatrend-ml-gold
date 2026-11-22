@@ -140,7 +140,8 @@ def label_events(d, horizon=12, barrier_atr=1.5, min_events=35):
         valid.append((ix,int(outcome)))
     if not valid: raise ValueError('Sıkışma olayı bulunamadı. Daha uzun veri veya daha esnek sqz-factor deneyin.')
     ix = [item[0] for item in valid]
-    events = d.loc[ix, ['time','close','atr','width_pct']+FEATURES].copy()
+
+events = d.loc[ix, list(dict.fromkeys(['time','close','atr','width_pct']+FEATURES))].copy()
     events['label'] = [item[1] for item in valid]
     events['bar_index'] = ix
     if len(events)<min_events:
